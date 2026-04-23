@@ -1,8 +1,9 @@
 """Database Connection and Operations"""
 from motor.motor_asyncio import AsyncIOMotorClient
 from .config import settings
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+from bson import ObjectId
 import uuid
 
 class Database:
@@ -42,10 +43,60 @@ class UserDB:
     @staticmethod
     async def get_user_by_id(user_id: str):
         """Get user by ID"""
-        from bson import ObjectId
         return await db.db["users"].find_one({"_id": ObjectId(user_id)})
 
+async def get_provider_scopes(provider_id: str):
+    """Resolve legacy provider ids that should be visible to this provider account."""
+    scopes = [provider_id]
+    user = await UserDB.get_user_by_id(provider_id)
+
+    if user and user.get("role") == "provider":
+        legacy_provider_emails = {
+            "provider@ecommerce.local",
+            "provider@example.com",
+        }
+        if user.get("email") in legacy_provider_emails:
+            scopes.append("provider_001")
+
+    return scopes
+
 class ProductDB:
+    @staticmethod
+    async def update_product(product_id: str, provider_id: str, update_data: dict):
+        provider_scopes = await get_provider_scopes(provider_id)
+        clean_data = {k: v for k, v in update_data.items() if v is not None}
+        clean_data["updated_at"] = datetime.utcnow()
+        existing_product = await db.db["products"].find_one(
+            {"_id": ObjectId(product_id), "provider_id": {"$in": provider_scopes}}
+        )
+
+        if not existing_product:
+            return False
+
+        result = await db.db["products"].update_one(
+            {"_id": ObjectId(product_id), "provider_id": {"$in": provider_scopes}},
+            {"$set": clean_data}
+        )
+
+        if "stock" in clean_data and clean_data["stock"] != existing_product.get("stock", 0):
+            await InventoryDB.log_stock_change(
+                product_id=product_id,
+                provider_id=existing_product.get("provider_id"),
+                old_stock=existing_product.get("stock", 0),
+                new_stock=clean_data["stock"],
+                quantity_changed=clean_data["stock"] - existing_product.get("stock", 0),
+                reason="Manual edit from provider panel"
+            )
+
+        return result.matched_count > 0
+
+    @staticmethod
+    async def delete_product(product_id: str, provider_id: str):
+        provider_scopes = await get_provider_scopes(provider_id)
+        result = await db.db["products"].delete_one(
+            {"_id": ObjectId(product_id), "provider_id": {"$in": provider_scopes}}
+        )
+        return result.deleted_count > 0
     @staticmethod
     async def create_product(product_data: dict):
         """Create new product"""
@@ -58,7 +109,6 @@ class ProductDB:
     @staticmethod
     async def get_product_by_id(product_id: str):
         """Get product by ID"""
-        from bson import ObjectId
         return await db.db["products"].find_one({"_id": ObjectId(product_id)})
     
     @staticmethod
@@ -69,16 +119,29 @@ class ProductDB:
     @staticmethod
     async def get_products_by_provider(provider_id: str):
         """Get all products by provider"""
-        return await db.db["products"].find({"provider_id": provider_id}).to_list(None)
+        provider_scopes = await get_provider_scopes(provider_id)
+        products = await db.db["products"].find({"provider_id": {"$in": provider_scopes}}).to_list(None)
+        for product in products:
+            product["_id"] = str(product["_id"])
+        return products
     
     @staticmethod
-    async def update_product_stock(product_id: str, quantity_change: int, reason: str):
+    async def update_product_stock(
+        product_id: str,
+        quantity_change: int,
+        reason: str,
+        provider_id: Optional[str] = None
+    ):
         """
         Update product stock with logging
         quantity_change: positive (add), negative (remove)
         """
-        from bson import ObjectId
-        product = await db.db["products"].find_one({"_id": ObjectId(product_id)})
+        query = {"_id": ObjectId(product_id)}
+        if provider_id is not None:
+            provider_scopes = await get_provider_scopes(provider_id)
+            query["provider_id"] = {"$in": provider_scopes}
+
+        product = await db.db["products"].find_one(query)
         
         if not product:
             return None
@@ -91,7 +154,7 @@ class ProductDB:
         
         # Update stock
         updated = await db.db["products"].update_one(
-            {"_id": ObjectId(product_id)},
+            query,
             {"$set": {"stock": new_stock, "updated_at": datetime.utcnow()}}
         )
         
@@ -111,7 +174,6 @@ class OrderDB:
     @staticmethod
     async def create_order(order_data: dict):
         """Create new order with idempotency key"""
-        from bson import ObjectId
         
         # Generate idempotency key if not exists
         if not order_data.get("idempotency_key"):
@@ -126,7 +188,6 @@ class OrderDB:
     @staticmethod
     async def get_order_by_id(order_id: str):
         """Get order by ID"""
-        from bson import ObjectId
         return await db.db["orders"].find_one({"_id": ObjectId(order_id)})
     
     @staticmethod
@@ -142,7 +203,6 @@ class OrderDB:
     @staticmethod
     async def update_order_status(order_id: str, status: str):
         """Update order status"""
-        from bson import ObjectId
         await db.db["orders"].update_one(
             {"_id": ObjectId(order_id)},
             {"$set": {"status": status, "updated_at": datetime.utcnow()}}
@@ -232,22 +292,39 @@ class DashboardDB:
     @staticmethod
     async def get_provider_dashboard(provider_id: str):
         """Get dashboard summary for provider"""
-        from bson import ObjectId
+        provider_scopes = await get_provider_scopes(provider_id)
         
         # Total products and stock
         products = await db.db["products"].find(
-            {"provider_id": provider_id}
+            {"provider_id": {"$in": provider_scopes}}
         ).to_list(None)
         
         total_products = len(products)
         total_stock = sum(p.get("stock", 0) for p in products)
+        total_categories = len({
+            (product.get("category") or "").strip()
+            for product in products
+            if (product.get("category") or "").strip()
+        })
         
         # Low stock items (< 5)
-        low_stock = [p for p in products if p.get("stock", 0) < 5]
+        low_stock = [
+            {
+                "_id": str(product.get("_id")),
+                "name": product.get("name"),
+                "sku": product.get("sku"),
+                "stock": product.get("stock", 0),
+                "category": product.get("category"),
+                "price": product.get("price", 0),
+                "provider_id": product.get("provider_id"),
+            }
+            for product in products
+            if product.get("stock", 0) < 5
+        ]
         
         # Total revenue and orders
         orders = await db.db["orders"].find({
-            "provider_id": provider_id,
+            "provider_id": {"$in": provider_scopes},
             "status": {"$ne": "cancelled"}
         }).to_list(None)
         
@@ -275,6 +352,7 @@ class DashboardDB:
         return {
             "total_products": total_products,
             "total_stock": total_stock,
+            "total_categories": total_categories,
             "low_stock_items": low_stock,
             "total_revenue": total_revenue,
             "total_orders": total_orders,

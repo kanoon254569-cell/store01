@@ -32,16 +32,28 @@ class ProductBase(BaseModel):
     category: str
 
 class ProductCreate(ProductBase):
-    provider_id: str
+    provider_id: Optional[str] = None
+
+class ProductUpdate(BaseModel): # เพิ่มสำหรับการ Edit
+    name: Optional[str] = None
+    sku: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    stock: Optional[int] = None
+    category: Optional[str] = None
+
+class RestockRequest(BaseModel):
+    quantity: int = Field(gt=0)
+    reason: Optional[str] = "Manual restock"
 
 class Product(ProductBase):
     id: str = Field(alias="_id")
     provider_id: str
     created_at: datetime
     updated_at: datetime
-    stock_history: List[dict] = []  # Track stock changes
     
     class Config:
+        populate_by_name = True
         from_attributes = True
 
 # ===================== USER =====================
@@ -51,6 +63,10 @@ class UserBase(BaseModel):
     role: UserRole
 
 class UserCreate(UserBase):
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
     password: str
 
 class User(UserBase):
@@ -68,10 +84,32 @@ class OrderItemBase(BaseModel):
     quantity: int
     price_at_purchase: float
 
+class OrderPricing(BaseModel):
+    currency: str = "USD"
+    subtotal: float
+    discount_code: Optional[str] = None
+    discount_rate: float = 0
+    discount_amount: float = 0
+    taxable_amount: float
+    commission_rate: float = 0
+    commission_amount: float = 0
+    tax_label: str = "VAT"
+    tax_rate: float = 0
+    tax_amount: float = 0
+    grand_total: float
+    provider_net_amount: float
+    platform_fee_amount: float
+
+class BillingSummary(BaseModel):
+    invoice_number: str
+    issued_at: datetime
+    currency: str = "USD"
+
 class OrderCreate(BaseModel):
     items: List[OrderItemBase]
     shipping_address: str
     payment_method: str
+    discount_code: Optional[str] = None
 
 class Order(BaseModel):
     id: str = Field(alias="_id")
@@ -84,10 +122,19 @@ class Order(BaseModel):
     created_at: datetime
     updated_at: datetime
     shipping_address: str
+    payment_method: str
+    pricing: Optional[OrderPricing] = None
+    billing: Optional[BillingSummary] = None
     idempotency_key: Optional[str] = None  # ป้องกัน duplicate purchases
     
     class Config:
         from_attributes = True
+
+class PaymentRequest(BaseModel):
+    card_number: str
+    card_holder: str
+    expiry: str
+    cvv: str
 
 # ===================== TRANSACTION LOG (Duplicate Purchase Prevention) =====================
 class TransactionLog(BaseModel):

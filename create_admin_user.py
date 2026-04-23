@@ -22,9 +22,9 @@ async def create_admin_user():
         print("✅ Connected to MongoDB")
         
         # Admin credentials
-        admin_email = "admin@ecommerce.local"
+        admin_email = "admin@example.com"
         admin_username = "admin"
-        admin_password = "Admin@123456"
+        admin_password = "admin123"
         
         # Check if admin already exists
         existing = db["users"].find_one({"email": admin_email})

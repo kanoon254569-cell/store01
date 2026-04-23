@@ -1,6 +1,18 @@
 """Configuration Management"""
 import os
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
+
+
+def _coerce_debug(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "debug", "dev", "development"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "release", "prod", "production"}:
+        return False
+    return True
 
 class Settings(BaseSettings):
     # MongoDB
@@ -17,9 +29,14 @@ class Settings(BaseSettings):
     PURCHASE_LIMIT_PER_MINUTE: int = 5  # ป้องกัน double purchase
     
     # Server
-    DEBUG: bool = os.getenv("DEBUG", "True") == "True"
+    DEBUG: bool = True
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, value):
+        return _coerce_debug(value)
     
     class Config:
         env_file = ".env"

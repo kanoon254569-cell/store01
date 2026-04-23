@@ -172,7 +172,7 @@ async def validate_stock_availability(product_id: str, requested_quantity: int) 
     Validate if product has enough stock
     This prevents overselling
     """
-    from database import ProductDB
+    from .database import ProductDB
     
     product = await ProductDB.get_product_by_id(product_id)
     

@@ -2,29 +2,222 @@
 from fastapi import FastAPI, HTTPException, status, Depends, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
 import uvicorn
 import os
 
 from .config import settings
 from .database import (
     connect_to_mongo, close_mongo_connection, db,
-    UserDB, ProductDB, OrderDB, TransactionLogDB, InventoryDB, DashboardDB
+    UserDB, ProductDB, OrderDB, TransactionLogDB, InventoryDB, DashboardDB,
+    get_provider_scopes
 )
 from .security import (
     create_access_token, get_current_user, duplicate_prevention,
     db_rate_limiter, validate_stock_availability, idempotency_handler
 )
 from .models import (
-    UserCreate, User, ProductCreate, Product, OrderCreate, Order,
-    UserRole, OrderStatus, PaymentStatus
+    UserCreate, User, ProductCreate, Product, ProductUpdate, OrderCreate, Order, LoginRequest,
+    UserRole, OrderStatus, PaymentStatus, RestockRequest, PaymentRequest
 )
 from .data_loader import load_excel_data, seed_database
 from typing import Optional, List
 from bson import ObjectId
 import uuid
 import bcrypt
+
+COMMISSION_RATE = 0.08
+VAT_RATE = 0.07
+TAX_LABEL = "VAT"
+DISCOUNT_RULES = {
+    "SAVE10": 0.10,
+    "SAVE15": 0.15,
+    "VIP20": 0.20,
+}
+
+def round_money(value: float) -> float:
+    return round(value + 1e-9, 2)
+
+def resolve_discount_rate(subtotal: float, discount_code: Optional[str]) -> tuple[Optional[str], float]:
+    normalized_code = (discount_code or "").strip().upper() or None
+    if normalized_code and normalized_code in DISCOUNT_RULES:
+        return normalized_code, DISCOUNT_RULES[normalized_code]
+    if subtotal >= 1000:
+        return normalized_code, 0.12
+    if subtotal >= 500:
+        return normalized_code, 0.07
+    if subtotal >= 200:
+        return normalized_code, 0.03
+    return normalized_code, 0.0
+
+def calculate_order_pricing(items: List[dict], discount_code: Optional[str] = None) -> dict:
+    subtotal = round_money(sum(item["quantity"] * item["price_at_purchase"] for item in items))
+    normalized_code, discount_rate = resolve_discount_rate(subtotal, discount_code)
+    discount_amount = round_money(subtotal * discount_rate)
+    taxable_amount = round_money(max(subtotal - discount_amount, 0))
+    commission_amount = round_money(taxable_amount * COMMISSION_RATE)
+    tax_amount = round_money(taxable_amount * VAT_RATE)
+    grand_total = round_money(taxable_amount + tax_amount)
+    provider_net_amount = round_money(taxable_amount - commission_amount)
+
+    return {
+        "currency": "USD",
+        "subtotal": subtotal,
+        "discount_code": normalized_code,
+        "discount_rate": discount_rate,
+        "discount_amount": discount_amount,
+        "taxable_amount": taxable_amount,
+        "commission_rate": COMMISSION_RATE,
+        "commission_amount": commission_amount,
+        "tax_label": TAX_LABEL,
+        "tax_rate": VAT_RATE,
+        "tax_amount": tax_amount,
+        "grand_total": grand_total,
+        "provider_net_amount": provider_net_amount,
+        "platform_fee_amount": commission_amount,
+    }
+
+def build_invoice_metadata() -> dict:
+    issued_at = datetime.utcnow()
+    return {
+        "invoice_number": f"INV-{issued_at.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}",
+        "issued_at": issued_at,
+        "currency": "USD",
+    }
+
+class AdminProfilePayload(BaseModel):
+    name: str
+    email: str
+    role: str = "user"
+    phone: Optional[str] = ""
+    address: Optional[str] = ""
+
+class AdminProductPayload(BaseModel):
+    name: str
+    sku: str
+    category: str
+    price: float
+    stock: int = 0
+    featured: int = 1
+    description: Optional[str] = ""
+    provider_id: Optional[str] = None
+
+class AdminOrderItemPayload(BaseModel):
+    productId: str
+    name: Optional[str] = ""
+    quantity: int = Field(gt=0)
+    price: float = Field(ge=0)
+
+class AdminOrderPayload(BaseModel):
+    profile_id: Optional[str] = None
+    user_name: str
+    status: str = "Pending"
+    total: float = Field(ge=0)
+    items: List[AdminOrderItemPayload] = Field(default_factory=list)
+    notes: Optional[str] = ""
+
+class AdminCheckoutPayload(BaseModel):
+    profile_id: str
+    items: List[AdminOrderItemPayload] = Field(default_factory=list)
+    notes: Optional[str] = ""
+
+def parse_object_id(value: str, field_name: str) -> ObjectId:
+    try:
+        return ObjectId(str(value))
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {field_name}"
+        )
+
+def normalize_order_status(value: Optional[str]) -> str:
+    normalized = (value or "pending").strip().lower()
+    allowed_statuses = {"pending", "confirmed", "shipped", "completed", "cancelled", "packed"}
+    return normalized if normalized in allowed_statuses else "pending"
+
+def serialize_profile(user: dict) -> dict:
+    return {
+        "id": str(user["_id"]),
+        "name": user.get("username") or user.get("name") or user.get("email", "").split("@")[0],
+        "email": user.get("email", ""),
+        "role": str(user.get("role", "user")).title(),
+        "phone": user.get("phone", ""),
+        "address": user.get("address", ""),
+    }
+
+def serialize_product(product: dict) -> dict:
+    return {
+        "id": str(product["_id"]),
+        "name": product.get("name", ""),
+        "sku": product.get("sku", ""),
+        "category": product.get("category", ""),
+        "price": float(product.get("price", 0) or 0),
+        "stock": int(product.get("stock", 0) or 0),
+        "featured": int(product.get("featured", 1) or 0),
+        "description": product.get("description", "") or "",
+        "provider_id": product.get("provider_id"),
+    }
+
+def serialize_order(order: dict, user_lookup: dict, product_lookup: dict) -> dict:
+    items = []
+    for item in order.get("items", []):
+        product_id = str(item.get("product_id", ""))
+        product = product_lookup.get(product_id, {})
+        items.append({
+            "productId": product_id,
+            "name": item.get("name") or product.get("name", "Unknown product"),
+            "quantity": int(item.get("quantity", 0) or 0),
+            "price": float(item.get("price_at_purchase", 0) or 0),
+        })
+
+    user_id = order.get("user_id")
+    profile = user_lookup.get(str(user_id)) if user_id else None
+
+    return {
+        "id": str(order["_id"]),
+        "profile_id": str(user_id) if user_id else None,
+        "user_name": order.get("user_name") or (profile.get("name") if profile else "Unknown user"),
+        "status": normalize_order_status(order.get("status")).title(),
+        "total": float(order.get("total_amount", 0) or 0),
+        "items": items,
+        "notes": order.get("notes", "") or "",
+    }
+
+async def require_admin_user(current_user: str) -> dict:
+    user = await UserDB.get_user_by_id(current_user)
+    if not user or user.get("role") != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return user
+
+async def enforce_admin_access(current_user: str) -> dict:
+    await db_rate_limiter.check_circuit_breaker()
+    if not await db_rate_limiter.check_user_rate(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded"
+        )
+    return await require_admin_user(current_user)
+
+async def build_admin_studio_snapshot() -> dict:
+    users = await db.db["users"].find({}).sort("created_at", -1).to_list(None)
+    products = await db.db["products"].find({}).sort("updated_at", -1).to_list(None)
+    orders = await db.db["orders"].find({}).sort("created_at", -1).to_list(None)
+
+    serialized_profiles = [serialize_profile(user) for user in users]
+    user_lookup = {profile["id"]: profile for profile in serialized_profiles}
+    product_lookup = {str(product["_id"]): product for product in products}
+
+    return {
+        "profiles": serialized_profiles,
+        "products": [serialize_product(product) for product in products],
+        "orders": [serialize_order(order, user_lookup, product_lookup) for order in orders],
+    }
 
 # ===================== LIFESPAN =====================
 
@@ -135,17 +328,43 @@ async def register(user: UserCreate):
     }
 
 @app.post("/api/auth/login")
-async def login(email: str = Query(...), password: str = Query(...)):
+async def login(credentials: LoginRequest):
     """Login user"""
-    user = await UserDB.get_user_by_email(email)
+    print(f"🔍 Login attempt: email={credentials.email}")
     
-    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+    user = await UserDB.get_user_by_email(credentials.email)
+    print(f"  User found: {bool(user)}")
+    
+    if not user:
+        print(f"  ❌ User not found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials"
+        )
+    
+    try:
+        password_hash = user["password_hash"]
+        is_valid = bcrypt.checkpw(
+            credentials.password.encode(), 
+            password_hash.encode()
+        )
+        print(f"  Password valid: {is_valid}")
+        
+        if not is_valid:
+            print(f"  ❌ Password mismatch")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+    except Exception as e:
+        print(f"  ❌ Password check error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
     
     access_token = create_access_token({"sub": str(user["_id"])})
+    print(f"  ✅ Login successful, token created")
     
     return {
         "user_id": str(user["_id"]),
@@ -226,6 +445,360 @@ async def admin_inventory_status(current_user: str = Depends(get_current_user)):
         }
     }
 
+@app.get("/api/admin/studio/bootstrap")
+async def admin_studio_bootstrap(current_user: str = Depends(get_current_user)):
+    """Admin studio bootstrap data backed by MongoDB."""
+    await enforce_admin_access(current_user)
+    return await build_admin_studio_snapshot()
+
+@app.post("/api/admin/studio/profiles")
+async def admin_create_profile(
+    profile: AdminProfilePayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Create a new profile in the users collection."""
+    await enforce_admin_access(current_user)
+
+    existing_user = await db.db["users"].find_one({"email": profile.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already exists"
+        )
+
+    password_hash = bcrypt.hashpw(uuid.uuid4().hex.encode(), bcrypt.gensalt()).decode()
+    user_data = {
+        "email": profile.email.strip(),
+        "username": profile.name.strip(),
+        "password_hash": password_hash,
+        "role": profile.role.strip().lower() or "user",
+        "phone": (profile.phone or "").strip(),
+        "address": (profile.address or "").strip(),
+        "is_active": True,
+        "managed_by_admin_studio": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    result = await db.db["users"].insert_one(user_data)
+    created_user = await db.db["users"].find_one({"_id": result.inserted_id})
+    return {"profile": serialize_profile(created_user)}
+
+@app.put("/api/admin/studio/profiles/{profile_id}")
+async def admin_update_profile(
+    profile_id: str,
+    profile: AdminProfilePayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Update a profile in the users collection."""
+    await enforce_admin_access(current_user)
+    profile_object_id = parse_object_id(profile_id, "profile_id")
+
+    existing_user = await db.db["users"].find_one({"email": profile.email, "_id": {"$ne": profile_object_id}})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already exists"
+        )
+
+    result = await db.db["users"].update_one(
+        {"_id": profile_object_id},
+        {"$set": {
+            "email": profile.email.strip(),
+            "username": profile.name.strip(),
+            "role": profile.role.strip().lower() or "user",
+            "phone": (profile.phone or "").strip(),
+            "address": (profile.address or "").strip(),
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+
+    updated_user = await db.db["users"].find_one({"_id": profile_object_id})
+    return {"profile": serialize_profile(updated_user)}
+
+@app.delete("/api/admin/studio/profiles/{profile_id}")
+async def admin_delete_profile(
+    profile_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """Delete a profile from the users collection."""
+    await enforce_admin_access(current_user)
+    if profile_id == current_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot delete the current admin profile"
+        )
+
+    result = await db.db["users"].delete_one({"_id": parse_object_id(profile_id, "profile_id")})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    return {"status": "deleted"}
+
+@app.post("/api/admin/studio/products")
+async def admin_create_product(
+    product: AdminProductPayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Create a product for the admin studio."""
+    await enforce_admin_access(current_user)
+
+    existing_product = await ProductDB.get_product_by_sku(product.sku)
+    if existing_product:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SKU already exists"
+        )
+
+    product_data = {
+        "name": product.name.strip(),
+        "sku": product.sku.strip(),
+        "category": product.category.strip(),
+        "price": float(product.price),
+        "stock": int(product.stock),
+        "featured": int(product.featured),
+        "description": (product.description or "").strip(),
+        "provider_id": product.provider_id or current_user,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "stock_history": [],
+    }
+    result = await db.db["products"].insert_one(product_data)
+    created_product = await db.db["products"].find_one({"_id": result.inserted_id})
+    return {"product": serialize_product(created_product)}
+
+@app.put("/api/admin/studio/products/{product_id}")
+async def admin_update_product(
+    product_id: str,
+    product: AdminProductPayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Update a product for the admin studio."""
+    await enforce_admin_access(current_user)
+    product_object_id = parse_object_id(product_id, "product_id")
+
+    existing_product = await db.db["products"].find_one({"sku": product.sku, "_id": {"$ne": product_object_id}})
+    if existing_product:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="SKU already exists"
+        )
+
+    result = await db.db["products"].update_one(
+        {"_id": product_object_id},
+        {"$set": {
+            "name": product.name.strip(),
+            "sku": product.sku.strip(),
+            "category": product.category.strip(),
+            "price": float(product.price),
+            "stock": int(product.stock),
+            "featured": int(product.featured),
+            "description": (product.description or "").strip(),
+            "provider_id": product.provider_id or current_user,
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    updated_product = await db.db["products"].find_one({"_id": product_object_id})
+    return {"product": serialize_product(updated_product)}
+
+@app.delete("/api/admin/studio/products/{product_id}")
+async def admin_delete_product(
+    product_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """Delete a product from the admin studio."""
+    await enforce_admin_access(current_user)
+    result = await db.db["products"].delete_one({"_id": parse_object_id(product_id, "product_id")})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    return {"status": "deleted"}
+
+@app.post("/api/admin/studio/orders")
+async def admin_create_order(
+    order: AdminOrderPayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Create an order without inventory mutation."""
+    await enforce_admin_access(current_user)
+
+    order_items = [
+        {
+            "product_id": item.productId,
+            "name": item.name or "",
+            "quantity": int(item.quantity),
+            "price_at_purchase": float(item.price),
+        }
+        for item in order.items
+    ]
+
+    provider_id = None
+    if order_items:
+        first_product = await ProductDB.get_product_by_id(order_items[0]["product_id"])
+        provider_id = first_product.get("provider_id") if first_product else None
+
+    order_data = {
+        "user_id": order.profile_id,
+        "user_name": order.user_name.strip(),
+        "provider_id": provider_id,
+        "items": order_items,
+        "status": normalize_order_status(order.status),
+        "payment_status": PaymentStatus.PENDING,
+        "total_amount": float(order.total),
+        "notes": (order.notes or "").strip(),
+        "shipping_address": "",
+        "payment_method": "admin_manual",
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    result = await db.db["orders"].insert_one(order_data)
+    created_order = await db.db["orders"].find_one({"_id": result.inserted_id})
+    snapshot = await build_admin_studio_snapshot()
+    order_lookup = {entry["id"]: entry for entry in snapshot["orders"]}
+    return {"order": order_lookup[str(created_order["_id"])]}
+
+@app.put("/api/admin/studio/orders/{order_id}")
+async def admin_update_order(
+    order_id: str,
+    order: AdminOrderPayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Update an order without inventory mutation."""
+    await enforce_admin_access(current_user)
+    order_object_id = parse_object_id(order_id, "order_id")
+
+    order_items = [
+        {
+            "product_id": item.productId,
+            "name": item.name or "",
+            "quantity": int(item.quantity),
+            "price_at_purchase": float(item.price),
+        }
+        for item in order.items
+    ]
+
+    provider_id = None
+    if order_items:
+        first_product = await ProductDB.get_product_by_id(order_items[0]["product_id"])
+        provider_id = first_product.get("provider_id") if first_product else None
+
+    result = await db.db["orders"].update_one(
+        {"_id": order_object_id},
+        {"$set": {
+            "user_id": order.profile_id,
+            "user_name": order.user_name.strip(),
+            "provider_id": provider_id,
+            "items": order_items,
+            "status": normalize_order_status(order.status),
+            "total_amount": float(order.total),
+            "notes": (order.notes or "").strip(),
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    snapshot = await build_admin_studio_snapshot()
+    order_lookup = {entry["id"]: entry for entry in snapshot["orders"]}
+    return {"order": order_lookup[order_id]}
+
+@app.delete("/api/admin/studio/orders/{order_id}")
+async def admin_delete_order(
+    order_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """Delete an order from the admin studio."""
+    await enforce_admin_access(current_user)
+    result = await db.db["orders"].delete_one({"_id": parse_object_id(order_id, "order_id")})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    return {"status": "deleted"}
+
+@app.post("/api/admin/studio/checkout")
+async def admin_checkout(
+    payload: AdminCheckoutPayload,
+    current_user: str = Depends(get_current_user)
+):
+    """Create a real order and decrement inventory using MongoDB."""
+    await enforce_admin_access(current_user)
+
+    if not payload.items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cart is empty"
+        )
+
+    profile = await UserDB.get_user_by_id(payload.profile_id)
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found"
+        )
+
+    order_items = []
+    provider_id = None
+    for item in payload.items:
+        product = await ProductDB.get_product_by_id(item.productId)
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Product not found: {item.productId}"
+            )
+        if product.get("stock", 0) < item.quantity:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient stock for {product.get('name', item.productId)}"
+            )
+
+        provider_id = provider_id or product.get("provider_id")
+        order_items.append({
+            "product_id": item.productId,
+            "name": product.get("name", item.name or ""),
+            "quantity": int(item.quantity),
+            "price_at_purchase": float(product.get("price", item.price)),
+        })
+
+    pricing = calculate_order_pricing(order_items)
+    billing = build_invoice_metadata()
+    order_data = {
+        "user_id": payload.profile_id,
+        "user_name": profile.get("username", ""),
+        "provider_id": provider_id,
+        "items": order_items,
+        "status": OrderStatus.PENDING,
+        "payment_status": PaymentStatus.PENDING,
+        "total_amount": pricing["grand_total"],
+        "notes": (payload.notes or "").strip(),
+        "shipping_address": profile.get("address", ""),
+        "payment_method": "admin_checkout",
+        "pricing": pricing,
+        "billing": billing,
+        "created_by_admin": current_user,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+
+    result = await db.db["orders"].insert_one(order_data)
+    order_id = str(result.inserted_id)
+
+    for item in order_items:
+        stock_result = await ProductDB.update_product_stock(
+            product_id=item["product_id"],
+            quantity_change=-item["quantity"],
+            reason=f"Admin checkout {order_id}"
+        )
+        if isinstance(stock_result, dict) and stock_result.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=stock_result["error"]
+            )
+
+    snapshot = await build_admin_studio_snapshot()
+    order_lookup = {entry["id"]: entry for entry in snapshot["orders"]}
+    return {"order": order_lookup[order_id]}
+
 # ===================== PROVIDER ROUTES (Add Products & Services) =====================
 
 @app.post("/api/provider/products")
@@ -257,26 +830,115 @@ async def provider_create_product(
         "message": "Product created successfully"
     }
 
+@app.get("/api/provider/products")
+async def provider_get_products(current_user: str = Depends(get_current_user)):
+    """Provider: Get own products"""
+    products = await ProductDB.get_products_by_provider(current_user)
+    return {"products": products}
+
+@app.put("/api/provider/products/{product_id}")
+async def provider_update_product(
+    product_id: str,
+    product: ProductUpdate,
+    current_user: str = Depends(get_current_user)
+):
+    """Provider: Update own product"""
+    await db_rate_limiter.check_circuit_breaker()
+
+    if not await db_rate_limiter.check_user_rate(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded"
+        )
+
+    provider_scopes = await get_provider_scopes(current_user)
+    existing_product = await ProductDB.get_product_by_id(product_id)
+    if not existing_product or existing_product.get("provider_id") not in provider_scopes:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found"
+        )
+
+    if product.sku:
+        sku_owner = await ProductDB.get_product_by_sku(product.sku)
+        if sku_owner and str(sku_owner["_id"]) != product_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="SKU already exists"
+            )
+
+    updated = await ProductDB.update_product(product_id, current_user, product.dict())
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found"
+        )
+
+    return {"message": "Product updated successfully"}
+
+@app.delete("/api/provider/products/{product_id}")
+async def provider_delete_product(
+    product_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """Provider: Delete own product"""
+    await db_rate_limiter.check_circuit_breaker()
+
+    if not await db_rate_limiter.check_user_rate(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded"
+        )
+
+    provider_scopes = await get_provider_scopes(current_user)
+    existing_product = await ProductDB.get_product_by_id(product_id)
+    if not existing_product or existing_product.get("provider_id") not in provider_scopes:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found"
+        )
+
+    deleted = await ProductDB.delete_product(product_id, current_user)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found"
+        )
+
+    return {"message": "Product deleted successfully"}
+
 @app.put("/api/provider/products/{product_id}/stock")
 async def provider_restock_product(
     product_id: str,
-    quantity: int,
-    reason: str = "Manual restock",
+    restock: RestockRequest,
     current_user: str = Depends(get_current_user)
 ):
     """Provider: Add stock to product"""
     await db_rate_limiter.check_circuit_breaker()
+
+    if not await db_rate_limiter.check_user_rate(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded"
+        )
     
     result = await ProductDB.update_product_stock(
         product_id=product_id,
-        quantity_change=quantity,
-        reason=reason
+        quantity_change=restock.quantity,
+        reason=restock.reason or "Manual restock",
+        provider_id=current_user
     )
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found"
+        )
     
     if isinstance(result, dict) and "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     
-    return {"message": f"Added {quantity} units", "result": result}
+    return {"message": f"Added {restock.quantity} units", "result": result}
 
 @app.get("/api/provider/dashboard")
 async def provider_dashboard(current_user: str = Depends(get_current_user)):
@@ -347,6 +1009,24 @@ async def user_get_product(product_id: str):
         )
     
     return product
+
+@app.post("/api/user/orders/preview")
+async def user_preview_order(
+    order: OrderCreate,
+    current_user: str = Depends(get_current_user)
+):
+    """Preview billing summary before creating an order"""
+    pricing = calculate_order_pricing(
+        [item.dict() for item in order.items],
+        order.discount_code
+    )
+    return {
+        "pricing": pricing,
+        "billing": {
+            "currency": pricing["currency"],
+            "tax_label": pricing["tax_label"],
+        }
+    }
 
 @app.post("/api/user/orders")
 async def user_create_order(
@@ -426,7 +1106,12 @@ async def user_create_order(
     
     # === STEP 7: Calculate total and create order ===
     try:
-        total_amount = sum(item.quantity * item.price_at_purchase for item in order.items)
+        pricing = calculate_order_pricing(
+            [item.dict() for item in order.items],
+            order.discount_code
+        )
+        billing = build_invoice_metadata()
+        total_amount = pricing["grand_total"]
         
         # Get provider_id from first product
         first_product = await ProductDB.get_product_by_id(order.items[0].product_id)
@@ -441,6 +1126,9 @@ async def user_create_order(
             "total_amount": total_amount,
             "shipping_address": order.shipping_address,
             "payment_method": order.payment_method,
+            "discount_code": order.discount_code,
+            "pricing": pricing,
+            "billing": billing,
             "idempotency_key": idempotency_key
         }
         
@@ -470,6 +1158,8 @@ async def user_create_order(
             "order_id": order_id,
             "status": "created",
             "total_amount": total_amount,
+            "pricing": pricing,
+            "billing": billing,
             "idempotency_key": idempotency_key
         }
         
@@ -514,6 +1204,154 @@ async def user_get_order_detail(
         )
     
     return order
+
+@app.get("/api/user/orders/{order_id}/invoice")
+async def get_order_invoice(
+    order_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """Get invoice and billing breakdown for a user's order"""
+    order = await OrderDB.get_order_by_id(order_id)
+
+    if not order or order.get("user_id") != current_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found"
+        )
+
+    return {
+        "order_id": order_id,
+        "status": order.get("status"),
+        "payment_status": order.get("payment_status"),
+        "billing": order.get("billing") or {},
+        "pricing": order.get("pricing") or {
+            "currency": "USD",
+            "subtotal": order.get("total_amount", 0),
+            "grand_total": order.get("total_amount", 0),
+            "tax_label": TAX_LABEL,
+        },
+        "items": order.get("items", []),
+        "shipping_address": order.get("shipping_address"),
+        "payment_method": order.get("payment_method"),
+    }
+# ===================== PAYMENT ROUTES =====================
+
+@app.post("/api/user/orders/{order_id}/payment")
+async def process_payment(
+    order_id: str,
+    payment_info: PaymentRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Process payment for order
+    
+    Payment validation:
+    1. Check if order exists and belongs to user
+    2. Validate credit card format
+    3. Process payment (mock implementation)
+    4. Update order status
+    """
+    from bson import ObjectId
+    
+    try:
+        # === Step 1: Get order ===
+        order = await OrderDB.get_order_by_id(order_id)
+        
+        if not order:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Order not found"
+            )
+        
+        if order.get("user_id") != current_user:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Unauthorized access to order"
+            )
+        
+        if order.get("payment_status") == "paid":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Order already paid"
+            )
+        
+        # === Step 2: Validate card format ===
+        if len(payment_info.card_number) < 16 or not payment_info.card_number.replace(" ", "").isdigit():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid card number"
+            )
+        
+        if len(payment_info.cvv) != 3 or not payment_info.cvv.isdigit():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid CVV"
+            )
+        
+        # === Step 3: Process payment (mock) ===
+        # ⚠️ In production, use Stripe, PayPal, etc.
+        payment_successful = True  # Mock: always success for demo
+        
+        if not payment_successful:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payment declined. Please try another card."
+            )
+        
+        # === Step 4: Update order status ===
+        await db.db["orders"].update_one(
+            {"_id": ObjectId(order_id)},
+            {
+                "$set": {
+                    "payment_status": "paid",
+                    "status": OrderStatus.CONFIRMED,
+                    "updated_at": datetime.utcnow(),
+                    "payment_date": datetime.utcnow(),
+                    "card_last_four": payment_info.card_number[-4:]
+                }
+            }
+        )
+        
+        return {
+            "status": "success",
+            "message": "Payment processed successfully",
+            "order_id": order_id,
+            "amount": (order.get("pricing") or {}).get("grand_total", order.get("total_amount")),
+            "invoice_number": (order.get("billing") or {}).get("invoice_number"),
+            "pricing": order.get("pricing"),
+            "card_last_four": payment_info.card_number[-4:]
+        }
+    
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Payment processing error: {str(e)}"
+        )
+
+@app.get("/api/user/orders/{order_id}/payment-status")
+async def get_payment_status(
+    order_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """Get payment status for order"""
+    order = await OrderDB.get_order_by_id(order_id)
+    
+    if not order or order.get("user_id") != current_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found"
+        )
+    
+    return {
+        "order_id": order_id,
+        "payment_status": order.get("payment_status"),
+        "pricing": order.get("pricing"),
+        "billing": order.get("billing"),
+        "total_amount": order.get("total_amount"),
+        "status": order.get("status")
+    }
 
 # ===================== HEALTH CHECK =====================
 
@@ -601,13 +1439,40 @@ async def admin_seed_excel(current_user: str = Depends(get_current_user)):
 # ===================== STATIC FILES ROUTES =====================
 
 frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
+frontend_vue_dist_path = os.path.join(os.path.dirname(__file__), "..", "frontend-vue", "dist")
+frontend_vue_assets_path = os.path.join(frontend_vue_dist_path, "assets")
+
+if os.path.exists(frontend_vue_dist_path):
+    app.mount(
+        "/studio",
+        StaticFiles(directory=frontend_vue_dist_path, html=True),
+        name="flow_studio"
+    )
+
+if os.path.exists(frontend_vue_assets_path):
+    app.mount(
+        "/assets",
+        StaticFiles(directory=frontend_vue_assets_path),
+        name="flow_studio_assets"
+    )
+
+if os.path.exists(frontend_path):
+    app.mount(
+        "/frontend-assets",
+        StaticFiles(directory=frontend_path),
+        name="frontend_assets"
+    )
 
 @app.get("/")
 async def serve_root():
-    """Serve login page at root"""
+    """Serve Flow Studio at root, fallback to login page"""
+    studio_file = os.path.join(frontend_vue_dist_path, "index.html")
+    if os.path.exists(studio_file):
+        return FileResponse(studio_file, media_type="text/html")
+
     login_file = os.path.join(frontend_path, "login.html")
     if os.path.exists(login_file):
-        return FileResponse(login_file)
+        return FileResponse(login_file, media_type="text/html")
     raise HTTPException(status_code=404, detail="Not Found")
 
 @app.get("/login")

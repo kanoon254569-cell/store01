@@ -193,54 +193,156 @@
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        .lang-switcher select {
+            padding: 8px 12px;
+            border-radius: 4px;
+            border: 1px solid #d5dbe0;
+        }
+
     </style>
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>📊 Admin Dashboard</h1>
-            <p>ยินดีต้อนรับเข้าสู่ระบบบริหารจัดการ</p>
+        <header style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1 id="pageTitle">📊 Admin Dashboard</h1>
+                <p id="pageSubtitle">Welcome to the management dashboard</p>
+            </div>
+            <div style="display:flex; gap:12px; align-items:center;">
+                <div class="lang-switcher">
+                    <select id="languageSwitcher">
+                        <option value="en">English</option>
+                        <option value="th">ไทย</option>
+                    </select>
+                </div>
+                <button onclick="handleLogout()" id="logoutButton" style="background: #e74c3c; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: 600;">🚪 Logout</button>
+            </div>
         </header>
-        
+
         <div id="message"></div>
         
         <div class="stats">
             <div class="stat-card">
-                <h3>📦 Total Products</h3>
+                <h3 id="totalProductsLabel">📦 Total Products</h3>
                 <div class="value" id="totalProducts">-</div>
             </div>
             <div class="stat-card stock">
-                <h3>📊 Total Stock</h3>
+                <h3 id="totalStockLabel">📊 Total Stock</h3>
                 <div class="value" id="totalStock">-</div>
             </div>
             <div class="stat-card revenue">
-                <h3>💰 Revenue</h3>
+                <h3 id="revenueLabel">💰 Revenue</h3>
                 <div class="value" id="totalRevenue">-</div>
             </div>
             <div class="stat-card orders">
-                <h3>📋 Orders</h3>
+                <h3 id="ordersLabel">📋 Orders</h3>
                 <div class="value" id="totalOrders">-</div>
             </div>
         </div>
         
         <div class="section">
-            <h2>🚨 Inventory Alerts</h2>
+            <h2 id="inventoryAlertsTitle">🚨 Inventory Alerts</h2>
             <div id="inventory-alerts" class="loading">Loading...</div>
         </div>
         
         <div class="section">
-            <h2>📦 SKU Summary</h2>
+            <h2 id="skuSummaryTitle">📦 SKU Summary</h2>
             <div id="sku-summary" class="loading">Loading...</div>
         </div>
     </div>
     
+    <script src="/frontend-assets/i18n.js"></script>
     <script>
-        const API_BASE = `http://${window.location.hostname}:8002`;
+        // Auto-detect API base URL based on current host
+        // Support both localhost, ngrok, and Docker Compose
+        const protocol = window.location.protocol;
+        const hostname = window.location.hostname;
+        const port = hostname === 'localhost' || hostname === '127.0.0.1' ? ':8000' : '';
+        const API_BASE = `${protocol}//${hostname}${port}`;
         let token = localStorage.getItem("auth_token");
+        const translations = {
+            en: {
+                title: "Admin Dashboard - E-Commerce",
+                pageTitle: "📊 Admin Dashboard",
+                pageSubtitle: "Welcome to the management dashboard",
+                logoutButton: "🚪 Logout",
+                totalProductsLabel: "📦 Total Products",
+                totalStockLabel: "📊 Total Stock",
+                revenueLabel: "💰 Revenue",
+                ordersLabel: "📋 Orders",
+                inventoryAlertsTitle: "🚨 Inventory Alerts",
+                skuSummaryTitle: "📦 SKU Summary",
+                loading: "Loading...",
+                unauthorized: "⚠️ Please login as admin first",
+                sku: "SKU",
+                productName: "Product Name",
+                stock: "Stock",
+                price: "Price",
+                totalValue: "Total Value",
+                criticalAlert: "🚨 Critical Stock Alert!",
+                outOfStock: "{count} product(s) out of stock",
+                lowStockAlert: "⚠️ Low Stock Alert!",
+                lowStockText: "{count} product(s) have low stock",
+                allGood: "✅ All inventory levels are good!",
+                errorPrefix: "❌ Error:"
+            },
+            th: {
+                title: "แดชบอร์ดผู้ดูแล - อีคอมเมิร์ซ",
+                pageTitle: "📊 แดชบอร์ดผู้ดูแล",
+                pageSubtitle: "ยินดีต้อนรับเข้าสู่ระบบบริหารจัดการ",
+                logoutButton: "🚪 ออกจากระบบ",
+                totalProductsLabel: "📦 จำนวนสินค้าทั้งหมด",
+                totalStockLabel: "📊 สต็อกรวม",
+                revenueLabel: "💰 รายได้",
+                ordersLabel: "📋 คำสั่งซื้อ",
+                inventoryAlertsTitle: "🚨 การแจ้งเตือนคลังสินค้า",
+                skuSummaryTitle: "📦 สรุป SKU",
+                loading: "กำลังโหลด...",
+                unauthorized: "⚠️ กรุณาเข้าสู่ระบบในฐานะผู้ดูแลก่อน",
+                sku: "SKU",
+                productName: "ชื่อสินค้า",
+                stock: "สต็อก",
+                price: "ราคา",
+                totalValue: "มูลค่ารวม",
+                criticalAlert: "🚨 แจ้งเตือนสต็อกวิกฤต!",
+                outOfStock: "สินค้าหมดสต็อก {count} รายการ",
+                lowStockAlert: "⚠️ แจ้งเตือนสต็อกต่ำ!",
+                lowStockText: "มีสินค้า {count} รายการที่สต็อกต่ำ",
+                allGood: "✅ ระดับสต็อกทั้งหมดอยู่ในเกณฑ์ดี!",
+                errorPrefix: "❌ ข้อผิดพลาด:"
+            }
+        };
+        
+        function t(key) {
+            const language = window.EcomI18n.getLanguage();
+            return translations[language][key] || translations.en[key] || key;
+        }
+        
+        function template(key, values = {}) {
+            let text = t(key);
+            Object.entries(values).forEach(([name, value]) => {
+                text = text.replace(`{${name}}`, value);
+            });
+            return text;
+        }
+        
+        function applyTranslations() {
+            document.title = t("title");
+            ["pageTitle","pageSubtitle","logoutButton","totalProductsLabel","totalStockLabel","revenueLabel","ordersLabel","inventoryAlertsTitle","skuSummaryTitle"].forEach((id) => {
+                const element = document.getElementById(id);
+                if (element) {
+                    element.textContent = t(id);
+                }
+            });
+            document.querySelectorAll(".loading").forEach((element) => {
+                element.textContent = t("loading");
+            });
+        }
         
         async function loadDashboard() {
             if (!token) {
-                showMessage("⚠️ Please login as admin first", "error");
+                showMessage(t("unauthorized"), "error");
                 return;
             }
             
@@ -272,10 +374,10 @@
                         <thead>
                             <tr>
                                 <th>SKU</th>
-                                <th>Product Name</th>
-                                <th>Stock</th>
-                                <th>Price</th>
-                                <th>Total Value</th>
+                                <th>${t("productName")}</th>
+                                <th>${t("stock")}</th>
+                                <th>${t("price")}</th>
+                                <th>${t("totalValue")}</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -294,7 +396,7 @@
                 document.getElementById("sku-summary").innerHTML = skuTable;
                 
             } catch (error) {
-                showMessage(`❌ Error: ${error.message}`, "error");
+                showMessage(`${t("errorPrefix")} ${error.message}`, "error");
             }
             
             // Load inventory status
@@ -316,8 +418,8 @@
                 if (data.critical_stock.count > 0) {
                     alerts += `
                         <div class="alert-critical">
-                            <strong>🚨 Critical Stock Alert!</strong>
-                            ${data.critical_stock.count} product(s) out of stock
+                            <strong>${t("criticalAlert")}</strong>
+                            ${template("outOfStock", { count: data.critical_stock.count })}
                         </div>
                     `;
                 }
@@ -325,14 +427,14 @@
                 if (data.low_stock.count > 0) {
                     alerts += `
                         <div class="alert-low-stock">
-                            <strong>⚠️ Low Stock Alert!</strong>
-                            ${data.low_stock.count} product(s) have low stock
+                            <strong>${t("lowStockAlert")}</strong>
+                            ${template("lowStockText", { count: data.low_stock.count })}
                         </div>
                     `;
                 }
                 
                 if (alerts === "") {
-                    alerts = '<div class="success">✅ All inventory levels are good!</div>';
+                    alerts = `<div class="success">${t("allGood")}</div>`;
                 }
                 
                 document.getElementById("inventory-alerts").innerHTML = alerts;
@@ -347,8 +449,20 @@
             msgDiv.innerHTML = `<div class="${type}">${msg}</div>`;
         }
         
+        function handleLogout() {
+            localStorage.removeItem("auth_token");
+            localStorage.removeItem("user_id");
+            window.location.href = "/login.html";
+        }
+        
+        
         // Load dashboard on page load
-        window.addEventListener("load", loadDashboard);
+        window.EcomI18n.bindSelect(document.getElementById("languageSwitcher"));
+        window.EcomI18n.init(applyTranslations);
+        window.addEventListener("load", () => {
+            applyTranslations();
+            loadDashboard();
+        });
         
         // Refresh every 30 seconds
         setInterval(loadDashboard, 30000);
